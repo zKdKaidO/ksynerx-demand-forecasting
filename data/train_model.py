@@ -1,111 +1,103 @@
-import os
+from pathlib import Path
 import pandas as pd
 import yaml
 import joblib
-from lightgbm import LGBMRegressor
 from mlforecast import MLForecast
-from mlforecast.lag_transforms import RollingMean
+from mlforecast.target_transforms import Differences
+from window_ops.rolling import rolling_mean, rolling_std
+
+# --- FIX ISSUE 2.3.7: THÊM CÁC MÔ HÌNH SO SÁNH ---
+from lightgbm import LGBMRegressor
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-def load_config(config_file: str = "config/config.yaml") -> dict:
-    with open(config_file, "r") as f:
+def load_config():
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    config_path = BASE_DIR / "config" / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"[CRITICAL] Can't find config at: {config_path}")
+    with open(config_path, "r") as f:
         return yaml.safe_load(f)
-
-def format_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Format columns to meet MLForecast requirements and prevent data leakage."""
-    processed_df = df.rename(columns={'adjusted_demand': 'y'})
-    
-    # Drop leaky columns
-    leaky_cols = ['units_ordered', 'stockout_flag']
-    processed_df = processed_df.drop(columns=leaky_cols, errors='ignore')
-    
-    # Enforce Category type for LightGBM
-    cat_cols = [
-        'store_id', 'product_id', 'location', 
-        'management_group', 'category_1', 'category_2', 'category_3',
-        'day_of_week', 'month', 'is_weekend', 'is_month_start', 
-        'is_month_end', 'holiday', 'is_promotion', 'is_raining', 'is_hot_weather'
-    ]
-    for col in cat_cols:
-        if col in processed_df.columns:
-            processed_df[col] = processed_df[col].astype('category')
-            
-    return processed_df
-
-def build_and_train_pipeline(train_df: pd.DataFrame, model_cfg: dict) -> MLForecast:
-    """Initialize LightGBM, wrap in MLForecast, and fit the data."""
-    print("[INFO] Initializing LightGBM and MLForecast pipeline...")
-    
-    model = LGBMRegressor(**model_cfg['lgbm_params'])
-    
-    fcst = MLForecast(
-        models={'lightgbm': model},
-        freq='D', 
-        lags=model_cfg['lags'],
-        # CÚ PHÁP MỚI ĐÃ ĐƯỢC SỬA Ở DÒNG DƯỚI ĐÂY:
-        lag_transforms={1: [RollingMean(window_size=7)]}
-    )
-    
-    static_features = [
-        'store_id', 'product_id', 'location', 
-        'management_group', 'category_1', 'category_2', 'category_3'
-    ]
-    
-    print("[INFO] Training model (fitting on Train Set)...")
-    fcst.fit(train_df, static_features=static_features)
-    return fcst
-
-def evaluate_model(fcst: MLForecast, eval_df: pd.DataFrame):
-    """Predict on eval set and calculate error metrics."""
-    print("[INFO] Running predictions on Eval Set...")
-    
-    horizon = eval_df['ds'].nunique()
-    
-    # 1. Khai báo lại danh sách biến tĩnh đã dùng lúc train
-    static_features = [
-        'store_id', 'product_id', 'location', 
-        'management_group', 'category_1', 'category_2', 'category_3'
-    ]
-    
-    # 2. X_df = Bỏ cột mục tiêu 'y' VÀ bỏ luôn các biến tĩnh
-    X_df = eval_df.drop(columns=['y'] + static_features)
-    
-    # 3. Dự báo
-    predictions = fcst.predict(h=horizon, X_df=X_df)
-    
-    # Merge predictions with actual true values (y) to compare
-    results = predictions.merge(eval_df[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='inner')
-    
-    mae = mean_absolute_error(results['y'], results['lightgbm'])
-    rmse = mean_squared_error(results['y'], results['lightgbm']) ** 0.5
-    
-    print("\n" + "="*40)
-    print("        MODEL EVALUATION RESULTS        ")
-    print("="*40)
-    print(f" Mean Absolute Error (MAE) : {mae:.4f}")
-    print(f" Root Mean Squared Error   : {rmse:.4f}")
-    print("="*40 + "\n")
 
 def main():
     cfg = load_config()
-    data_cfg = cfg['data']['files']
-    model_cfg = cfg['model']
     
-    print("[INFO] Loading Train and Eval datasets...")
-    raw_train = pd.read_parquet(data_cfg['train']['processed'])
-    raw_eval = pd.read_parquet(data_cfg['eval']['processed'])
+    print("[INFO] Loading datasets...")
+    train_df = pd.read_parquet(cfg['data']['files']['train']['processed'])
+    eval_df = pd.read_parquet(cfg['data']['files']['eval']['processed'])
     
-    train_df = format_data(raw_train)
-    eval_df = format_data(raw_eval)
+    # Chuyển đổi Category
+    static_features = cfg['data'].get('static_features', [])
+    cat_cols = ['day_of_week', 'month', 'week_of_year', 'year', 'is_weekend', 'is_month_start', 'is_month_end']
+    for col in static_features + cat_cols:
+        if col in train_df.columns:
+            train_df[col] = train_df[col].astype('category')
+            eval_df[col] = eval_df[col].astype('category')
+
+    object_cols = train_df.select_dtypes(include=['object']).columns.tolist()
+    if 'unique_id' in object_cols:
+        object_cols.remove('unique_id')
+        
+    if object_cols:
+        print(f"[WARNING] Dropping text/object columns to prevent LightGBM crash: {object_cols}")
+        train_df = train_df.drop(columns=object_cols)
+        eval_df = eval_df.drop(columns=object_cols, errors='ignore')
+    # Khởi tạo mô hình
+    lgbm_params = cfg['model']['lgbm_params']
     
-    fcst_pipeline = build_and_train_pipeline(train_df, model_cfg)
+    # Đưa nhiều mô hình vào thi đấu cùng lúc
+    models = {
+        'lightgbm': LGBMRegressor(**lgbm_params),
+        'ridge_baseline': Ridge(alpha=1.0),
+        'random_forest': RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42, n_jobs=-1)
+    }
     
-    evaluate_model(fcst_pipeline, eval_df)
+    # --- FIX ISSUE 2.3.1: Đa dạng hóa Lag Transforms ---
+    fcst_pipeline = MLForecast(
+        models=models,
+        freq='D',
+        lags=cfg['model']['lags'],
+        lag_transforms={
+            1: [(rolling_mean, 7), (rolling_std, 7)],  # Trung bình và độ lệch chuẩn 1 tuần qua
+            7: [(rolling_mean, 14)]                    # Trung bình 2 tuần dựa trên độ trễ 1 tuần
+        },
+        date_features=['dayofweek', 'month'],
+        num_threads=4
+    )
     
-    export_path = model_cfg['model_export_path']
-    os.makedirs(os.path.dirname(export_path), exist_ok=True)
-    joblib.dump(fcst_pipeline, export_path)
-    print(f"[SUCCESS] Trained model saved to: {export_path}")
+    print("[INFO] Training Multi-Model Pipeline (This may take a minute)...")
+    fcst_pipeline.fit(
+        train_df, 
+        id_col='unique_id', 
+        time_col='ds', 
+        target_col='y', 
+        static_features=static_features
+    )
+    
+    # Đánh giá đa mô hình
+    print("[INFO] Running predictions on Eval Set...")
+    horizon = eval_df['ds'].nunique()
+    
+    # Bỏ target và static features khi dự báo
+    X_df = eval_df.drop(columns=['y'] + static_features, errors='ignore')
+    predictions = fcst_pipeline.predict(h=horizon, X_df=X_df)
+    
+    results = predictions.merge(eval_df[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='inner')
+    
+    print("\n" + "="*50)
+    print("      MULTI-MODEL EVALUATION RESULTS      ")
+    print("="*50)
+    for model_name in models.keys():
+        mae = mean_absolute_error(results['y'], results[model_name])
+        rmse = mean_squared_error(results['y'], results[model_name]) ** 0.5
+        print(f"[{model_name.upper()}]")
+        print(f"  MAE  : {mae:.4f}")
+        print(f"  RMSE : {rmse:.4f}")
+        print("-" * 50)
+        
+    joblib.dump(fcst_pipeline, cfg['model']['model_export_path'])
+    print(f"[SUCCESS] Trained multi-model pipeline saved to: {cfg['model']['model_export_path']}")
 
 if __name__ == "__main__":
     main()

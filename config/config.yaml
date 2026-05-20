@@ -1,4 +1,12 @@
 data:
+  static_features:
+      - store_id
+      - product_id
+      - city_id
+      - management_group_id
+      - first_category_id
+      - second_category_id
+      - third_category_id
   target_city: 1
   files:
     train:

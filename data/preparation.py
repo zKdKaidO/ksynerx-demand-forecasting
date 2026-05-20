@@ -1,104 +1,89 @@
-import os
+from pathlib import Path
 import pandas as pd
 import numpy as np
+import os
 import yaml
 
-def load_config(config_file: str = "config/config.yaml") -> dict:
-    with open(config_file, "r") as f:
+def load_config():
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    config_path = BASE_DIR / "config" / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"[CRITICAL] Can't find config at: {config_path}")
+    with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-def load_data(file_path: str) -> pd.DataFrame:
-    print(f"[INFO] Loading raw data from: {file_path}")
-    return pd.read_parquet(file_path)
-
-def filter_city(df: pd.DataFrame, city_id: int) -> pd.DataFrame:
-    return df[df['city_id'] == city_id].copy()
-
-def apply_ldr(df: pd.DataFrame) -> pd.DataFrame:
-    available_hours = 16 - df['stock_hour6_22_cnt']
-    safe_hours = np.where(available_hours == 0, 1, available_hours)
-    
-    df['adjusted_demand'] = df['sale_amount'] * (16 / safe_hours)
-    df.loc[df['sale_amount'] == 0, 'adjusted_demand'] = 0.0
-    df['adjusted_demand'] = df['adjusted_demand'].round(2)
-    return df
-
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    processed = pd.DataFrame()
+    """Tạo các đặc trưng mới và xử lý ngoại lệ theo chuẩn."""
+    processed = df.copy()
     
-    # Identifiers
-    processed['unique_id'] = df['store_id'].astype(str) + "_" + df['product_id'].astype(str)
-    processed['store_id'] = df['store_id']
-    processed['product_id'] = df['product_id']
-    processed['location'] = df['city_id']
+    # 1. Đảm bảo cột thời gian chuẩn xác
+    dates = pd.to_datetime(processed['dt'])
+    processed['ds'] = dates
     
-    # Hierarchy
-    processed['management_group'] = df['management_group_id']
-    processed['category_1'] = df['first_category_id']
-    processed['category_2'] = df['second_category_id']
-    processed['category_3'] = df['third_category_id']
+    # --- FIX ISSUE 2.2.1: Thêm features week_of_year và year ---
+    processed['week_of_year'] = dates.dt.isocalendar().week.astype(int)
+    processed['year'] = dates.dt.year
     
-    # Temporal
-    dates = pd.to_datetime(df['dt'])
-    processed['ds'] = dates  
-    processed['day_of_week'] = dates.dt.dayofweek
-    processed['month'] = dates.dt.month
-    processed['is_weekend'] = processed['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
-    processed['is_month_start'] = dates.dt.is_month_start.astype(int)
-    processed['is_month_end'] = dates.dt.is_month_end.astype(int)
-    processed['holiday'] = df['holiday_flag']
+    # 2. Xây dựng Khóa chính (Unique ID)
+    processed['unique_id'] = processed['store_id'].astype(str) + "_" + processed['product_id'].astype(str)
     
-    # Context & Weather
-    processed['is_promotion'] = df['activity_flag']
-    processed['selling_price'] = df['discount']
-    processed['precipitation'] = df['precpt']
-    processed['temperature'] = df['avg_temperature']
-    processed['humidity'] = df['avg_humidity']
-    processed['wind_level'] = df['avg_wind_level']
-    processed['is_raining'] = df['precpt'].apply(lambda x: 1 if x > 0 else 0)
-    processed['is_hot_weather'] = df['avg_temperature'].apply(lambda x: 1 if x > 32 else 0)
+    # --- FIX ISSUE 2.2.2: Tối ưu công thức LDR (Lost Demand Rate) ---
+    # Tính số giờ thực tế có hàng trên kệ
+    available_hours = 16 - processed['stock_hour6_22_cnt']
     
-    # Targets
-    processed['units_ordered'] = df['sale_amount']
-    processed['stockout_flag'] = df['stock_hour6_22_cnt'].apply(lambda x: 1 if x > 0 else 0)
-    processed['adjusted_demand'] = df['adjusted_demand']
+    # Dùng np.where gộp để xử lý an toàn: Nếu không bán được gì (sale=0), nhu cầu = 0.
+    # Ngược lại, upscale nhu cầu dựa trên số giờ có hàng (tránh chia cho 0).
+    processed['adjusted_demand'] = np.where(
+        processed['sale_amount'] == 0, 
+        0.0, 
+        processed['sale_amount'] * (16 / np.maximum(available_hours, 1))
+    )
+    
+    # --- FIX ISSUE 2.2.4: Giữ lại giá gốc (nếu dataset có) hoặc đổi tên cho rõ ràng
+    # Tùy thuộc vào dataset thực tế của bạn, ở đây giả định discount là selling_price
+    processed['selling_price'] = processed['discount']
+    
+    # Đổi tên cột mục tiêu (y) cho mlforecast
+    processed['y'] = processed['adjusted_demand']
     
     return processed
 
-def process_file(raw_path: str, processed_path: str, city_id: int):
-    """Execute the full data pipeline for a single file."""
-    print(f"\n--- PROCESSING: {raw_path} ---")
-    raw_df = load_data(raw_path)
-    city_df = filter_city(raw_df, city_id)
-    ldr_df = apply_ldr(city_df)
-    final_df = build_features(ldr_df)
-    
-    final_df = final_df.sort_values(by=['unique_id', 'ds']).reset_index(drop=True)
-    
-    # Ensure directory exists before saving
-    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
-    final_df.to_parquet(processed_path, index=False)
-    print(f"[SUCCESS] Saved to: {processed_path}")
+def validate_data(df: pd.DataFrame):
+    """FIX ISSUE 2.2.3: Data Quality Validation (Chống dữ liệu rác)"""
+    print("[INFO] Running Data Validation...")
+    if (df['sale_amount'] < 0).any():
+        raise ValueError("Critical Data Error: Found negative sales amounts.")
+    if df.duplicated(subset=['unique_id', 'ds']).any():
+        print("[WARNING] Found duplicate (store, product, date) records. Dropping duplicates.")
+        df = df.drop_duplicates(subset=['unique_id', 'ds'])
+    print("[SUCCESS] Data validation passed.")
+    return df
 
 def main():
     cfg = load_config()
-    target_city = cfg['data']['target_city']
     
-    # Process Train Data
-    process_file(
-        cfg['data']['files']['train']['raw'], 
-        cfg['data']['files']['train']['processed'], 
-        target_city
-    )
+    print("[INFO] Loading raw Train and Eval data...")
+    train_df = pd.read_parquet(cfg['data']['files']['train']['raw'])
+    eval_df = pd.read_parquet(cfg['data']['files']['eval']['raw'])
     
-    # Process Eval Data
-    process_file(
-        cfg['data']['files']['eval']['raw'], 
-        cfg['data']['files']['eval']['processed'], 
-        target_city
-    )
+    print("[INFO] Processing Train data...")
+    train_ready = build_features(train_df)
+    train_ready = validate_data(train_ready)
     
-    print("\n[SUCCESS] STAGE 1 COMPLETE FOR BOTH TRAIN AND EVAL!")
+    print("[INFO] Processing Eval data...")
+    eval_ready = build_features(eval_df)
+    eval_ready = validate_data(eval_ready)
+    
+    # Loại bỏ các cột rò rỉ dữ liệu (Data Leakage)
+    leakage_cols = ['units_ordered', 'stockout_flag', 'dt', 'adjusted_demand', 'sale_amount']
+    drop_cols = [c for c in leakage_cols if c in train_ready.columns]
+    
+    train_ready = train_ready.drop(columns=drop_cols)
+    eval_ready = eval_ready.drop(columns=drop_cols)
+    
+    train_ready.to_parquet(cfg['data']['files']['train']['processed'], index=False)
+    eval_ready.to_parquet(cfg['data']['files']['eval']['processed'], index=False)
+    print(f"[SUCCESS] Data processed and saved.")
 
 if __name__ == "__main__":
     main()

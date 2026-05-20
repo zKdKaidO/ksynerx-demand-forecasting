@@ -1,20 +1,20 @@
 # --- DATA PREPARATION ---
 pandas
+numpy
 pyarrow
 datasets
 
 # --- MACHINE LEARNING & FORECASTING ---
 mlforecast
+window-ops
 scikit-learn
-xgboost
 lightgbm
-torch
 
 # --- MODEL SERVING & REST API ---
-ray[serve]
-# Xây dựng REST API
 fastapi
+pydantic
 uvicorn[standard]
 
+# --- UTILS ---
 pyyaml
 joblib
