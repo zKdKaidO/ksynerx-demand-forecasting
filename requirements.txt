@@ -1,0 +1,20 @@
+# --- DATA PREPARATION ---
+pandas
+pyarrow
+datasets
+
+# --- MACHINE LEARNING & FORECASTING ---
+mlforecast
+scikit-learn
+xgboost
+lightgbm
+torch
+
+# --- MODEL SERVING & REST API ---
+ray[serve]
+# Xây dựng REST API
+fastapi
+uvicorn[standard]
+
+pyyaml
+joblib

@@ -1,0 +1,6 @@
+models/
+venv/
+*.parquet
+*.csv
+*.pkl
+*.joblib

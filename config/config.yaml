@@ -1,0 +1,21 @@
+data:
+  target_city: 1
+  files:
+    train:
+      raw: "A:/FreshRetailNet-50K/data/train.parquet"
+      processed: "data/train_ready.parquet"
+    eval:
+      raw: "A:/FreshRetailNet-50K/data/eval.parquet"
+      processed: "data/eval_ready.parquet"
+
+model:
+  algorithm: "lightgbm"
+  lags: [1, 2, 3, 7]
+  model_export_path: "models/trained_lgbm_pipeline.pkl"
+  lgbm_params:
+    n_estimators: 1000    
+    learning_rate: 0.05
+    random_state: 42
+    # device_type: "gpu"     
+
+    # gpu_use_dp: false     
