@@ -3,6 +3,7 @@
 An end-to-end Machine Learning pipeline and RESTful API designed to forecast next-day adjusted inventory demand for fresh retail products. This project handles data preparation, time-series model training, and production-ready API serving.
 
 # Local Structure
+```text
 demand-forecasting/
 ├── api/
 │   └── serve_api.py             
@@ -20,7 +21,13 @@ demand-forecasting/
 ├── venv/                        
 ├── .gitignore                 
 ├── README.md                       
-└── requirements.txt            
+└── requirements.txt   
+
+To clearly explain how the working prototype functions from end-to-end, here is the lifecycle of the data and model within the system:
+
+1. **The Data Refinery (`preparation.py`):** The prototype starts by ingesting raw parquet files. It does not simply pass data through; it actively corrects business logic (Lost Demand Rate), caps extreme statistical outliers (99.9th percentile), and verifies time-series contiguity (date gap detection).
+2. **The Training Engine (`train_model.py`):** Clean data is fed into a multi-model MLForecast pipeline. The prototype trains three different algorithms to benchmark performance. It applies rolling means and standard deviations to capture recent volatility. Crucially, it outputs a highly detailed SRE-standard evaluation (Walk-Forward MAE and wMAPE) to the console, proving its reliability before serializing the best model (LightGBM) to disk.
+3. **The Serving Layer (`serve_api.py`):** The prototype spins up a FastAPI server. Upon startup, it preemptively calculates the chronological "Next Day" state for all products and caches it in memory. When a consumer requests a prediction, the API extracts the specific $O(1)$ state for that product, merges it with the dynamic JSON payload (weather, promotions), and returns the forecasted demand.
 ## 1. Dataset Overview
 
 The dataset used for this project is **FreshRetailNet-50K**, publicly available on [Hugging Face](https://huggingface.co/datasets/kSynerX/FreshRetailNet-50K). It consists of highly granular daily transaction logs, segmented into `train.parquet` (approx. 4.5M rows) and `eval.parquet` (approx. 350K rows).
@@ -168,4 +175,20 @@ FastAPI automatically generates an interactive documentation page where you can 
    * Click **Try it out**.
    * A sample JSON payload is already pre-filled. Simply click the blue **Execute** button.
    * Scroll down to the **Server response** section to see the forecasted demand!
+
+## 6. Feature Implementation Status
+
+To provide full transparency on the development process, below is a breakdown of which features were successfully delivered and which were deferred.
+
+### ✅ Considered and Implemented
+* **Robust Data Quality Gates:** Automated detection of date gaps, negative sales anomalies, and strict isolation of data leakage columns.
+* **Stateless, Zero-Global-Variable API:** The serving layer was strictly designed without global variables, utilizing FastAPI's `lifespan` context managers to handle model loading and cache state safely.
+* **Multi-Model Benchmarking:** Implementation of LightGBM (Primary), Ridge Regression, and Random Forest for comprehensive algorithmic comparison.
+* **Advanced Evaluation Metrics:** Shifting from standard MAE to volume-weighted MAE (wMAPE) and Walk-Forward horizon breakdowns.
+* **$O(1)$ Memory-Safe Inference:** Filtering the pre-computed future dataframe *before* copying to prevent memory bloat under concurrent API requests.
+
+### 🚧 Considered but Not Finished (Future Work)
+* **Distributed Computing with Ray:** The original specification suggested using `Ray Serve` and `Ray Train` for scalable data management and serving. Due to time constraints and the complexity of configuring a local Ray cluster, I opted for a highly optimized single-node FastAPI architecture. Transitioning this FastAPI logic to Ray Serve would be the immediate next step for horizontal scaling.
+* **ARIMA / ETS Statistical Baselines:** While linear (Ridge) and tree-based models were implemented, classic statistical models (like `statsforecast` AutoARIMA) were considered but left out to prioritize pipeline stability and training speed on local hardware.
+* **Automated Hyperparameter Tuning:** Optuna was considered for dynamic hyperparameter optimization. However, to ensure the prototype runs quickly for evaluators, I manually constrained the LightGBM parameters (`num_leaves`, `min_child_samples`) based on domain knowledge instead of implementing an exhaustive search.
 
