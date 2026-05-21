@@ -2,6 +2,25 @@
 
 An end-to-end Machine Learning pipeline and RESTful API designed to forecast next-day adjusted inventory demand for fresh retail products. This project handles data preparation, time-series model training, and production-ready API serving.
 
+# Local Structure
+demand-forecasting/
+├── api/
+│   └── serve_api.py             
+├── config/
+│   └── config.yaml              
+├── data/
+│   ├── __init__.py
+│   ├── eval_ready.parquet       
+│   ├── forecasting_data_ready.parquet 
+│   ├── preparation.py               # Data Pipeline: Feature engineering, Outlier capping, Validation
+│   ├── train_model.py               # Training Pipeline: Multi-model training (LGBM, Ridge, RF)
+│   └── train_ready.parquet      
+├── models/
+│   └── trained_lgbm_pipeline.pkl    
+├── venv/                        
+├── .gitignore                 
+├── README.md                       
+└── requirements.txt            
 ## 1. Dataset Overview
 
 The dataset used for this project is **FreshRetailNet-50K**, publicly available on [Hugging Face](https://huggingface.co/datasets/kSynerX/FreshRetailNet-50K). It consists of highly granular daily transaction logs, segmented into `train.parquet` (approx. 4.5M rows) and `eval.parquet` (approx. 350K rows).
@@ -16,25 +35,44 @@ The dataset used for this project is **FreshRetailNet-50K**, publicly available 
 
 ## 2. Data Preprocessing & Feature Engineering
 
-To ensure the model learns true market demand rather than constrained sales, several preprocessing steps were strictly applied:
+Working with real-world retail data requires moving beyond standard academic datasets. During this phase, I implemented several defensive programming and feature engineering techniques to ensure the data was robust enough for production-grade forecasting.
 
-* **Lost Demand Rate (LDR) Calculation:** The target variable is not raw sales, but `adjusted_demand`. If a product was out of stock for $H$ hours during the 16-hour operating window, the demand was upscaled using the formula: 
-  `adjusted_demand = sale_amount * (16 / (16 - H))`
-* **Feature Mapping & Extraction:**
-  * **Temporal Features:** Extracted `day_of_week`, `month`, `is_weekend`, `is_month_start`, and `is_month_end`.
-  * **Weather Binarization:** Mapped continuous weather data into practical flags (`is_raining` if precipitation > 0, `is_hot_weather` if temp > 32°C).
-* **Data Leakage Prevention:** Columns that contain future information or raw constraints (`units_ordered`, `stockout_flag`) were aggressively **dropped** from the training pipeline.
-* **Type Casting:** Static metadata (like categories and IDs) and temporal flags were explicitly cast to `category` types to optimize tree-based learning.
+### 2.1. Reconstructing True Demand (Lost Demand Rate)
+In retail, historical sales data only tells us what was actually bought, not what *could* have been bought if the shelves were fully stocked. 
+* **The Concept:** If a product sold 10 units but was out of stock for 8 hours out of a 16-hour business day, the recorded sales only represent half of the true daily demand.
+* **The Implementation:** I engineered an `adjusted_demand` target using a scaling factor: `sale_amount * (16 / available_hours)`. To ensure mathematical safety and avoid application crashes, a vectorized `np.maximum(available_hours, 1)` was used to strictly prevent "Divide by Zero" errors.
 
-## 3. Modeling Approach
+### 2.2. Guarding Against Extreme Outliers (Clipping)
+* **The Concept:** The scaling formula above can occasionally produce dangerous outliers. For example, selling 5 items in just 1 available hour inflates the daily demand to 80 items. Tree-based models (like LightGBM) can be overly penalized by these extreme, artificial variances in the target variable.
+* **The Implementation:** I applied **Percentile Capping (Clipping)**. Any adjusted demand exceeding the 99.9th percentile is aggressively capped. This bounds the target variable within a realistic physical limit, stabilizing the training loss without deleting valid rows.
 
-### Algorithm: LightGBM (via `mlforecast`)
-The forecasting engine uses **LightGBMRegressor** wrapped inside Nixtla's `mlforecast` framework. 
+### 2.3. Time-Series Contiguity and Lag Integrity
+* **The Concept:** Autoregressive models rely heavily on "Lags" (e.g., Lag 1 = yesterday's sales). If a store experiences a system outage and misses a day of data, Friday's record becomes directly adjacent to Sunday's. This silently corrupts the 1-day lag feature, tricking the model.
+* **The Implementation:** I built a gap detection mechanism utilizing Pandas `groupby` and `diff().dt.days`. Identifying time gaps `> 1 day` before passing data to the model is a crucial observability practice to ensure the integrity of rolling windows and lags.
 
-**Why LightGBM?**
-1. **Speed & Efficiency:** It easily handles millions of rows and computes gradients exceptionally fast, even on CPUs.
-2. **Categorical Handling:** It natively supports categorical features without requiring explosive One-Hot Encoding, which is crucial for retail data with thousands of product IDs.
-3. **Time-Series Suitability:** Combined with `mlforecast`, it efficiently captures non-linear relationships using historical lags (Lags: 1, 2, 3, 7) and rolling window aggregations (7-day rolling mean).
+### 2.4. Preventing Data Leakage
+* **The Concept:** Data leakage is a fatal flaw where a model has access to information during training that it will absolutely not have at prediction time (the future).
+* **The Implementation:** After engineering the final target (`y`) and features, all intermediate columns (like `sale_amount`, `discount`, `stock_hour6_22_cnt`) are rigorously dropped. If left in the training set, the model would over-rely on them and completely fail in the production API.
+
+## 3. Modeling Approach & Evaluation Strategy
+
+Moving beyond a basic implementation, I architected a forecasting pipeline that adheres to production standards, focusing on robust evaluation and capturing the true nature of volatile retail data.
+
+### 3.1. Multi-Model Benchmarking
+Instead of blindly trusting a single algorithm, I implemented a multi-model pipeline using `mlforecast` to compare different mathematical paradigms simultaneously:
+* **LightGBM (Tree-based Ensemble):** Selected for its exceptional speed, native handling of categorical IDs (without the memory explosion of One-Hot Encoding), and ability to capture non-linear trends.
+* **Ridge Regression (Linear Baseline):** Included as a conservative, autoregressive baseline. A key lesson learned was that while Tree-based models win on overall accuracy, linear models like Ridge are highly resistant to extreme outliers and rarely make wildly incorrect predictions.
+* **Random Forest:** Included to evaluate if bagging (variance reduction) would outperform boosting in this specific highly volatile dataset.
+
+### 3.2. Capturing Volatility via Lag Transforms
+Time-series models need more than just raw historical values (lags) to understand context.
+* **The Concept:** A product selling 50 units yesterday (Lag 1) could be on a steady trend, or it could be a chaotic spike. The model needs to know the difference.
+* **The Implementation:** I engineered rolling window transformations. A `rolling_mean` (7-day and 14-day) teaches the model the recent trend, while a `rolling_std` (Standard Deviation) acts as a "volatility sensor," helping the model distinguish between stable staple goods and erratic fresh produce.
+
+### 3.3. SRE-Standard Evaluation (Walk-Forward & wMAPE)
+Academic metrics like a single Global MAE are often deceptive in production. To prove the model's real-world viability, I implemented two critical evaluation techniques:
+1. **Walk-Forward Validation (Horizon Breakdown):** A model might predict tomorrow perfectly but fail miserably 3 days from now. By breaking down the MAE by horizon step (Day 1 vs. Day 2 vs. Day 3), I proved that the model maintains its predictive power over time without severe degradation.
+2. **Volume-Weighted Metric (wMAPE):** Global MAE treats a 10-unit error on a slow-moving item the same as a 10-unit error on a top-seller. I implemented **wMAPE (Weighted Mean Absolute Percentage Error)** to penalize errors based on actual sales volume, ensuring the evaluation reflects true business impact.
 
 ### Model Evaluation Results (City-Level Scope)
 After strictly filtering for the target city and applying outlier capping, the multi-model benchmarking on the held-out dataset yielded:
@@ -48,47 +86,86 @@ After strictly filtering for the target city and applying outlier capping, the m
 * Ridge Regression provided the lowest RMSE, indicating high resistance to extreme outlier predictions.
 * Horizon analysis (Walk-forward) confirms stable error rates across the first 3 days (MAE ~0.50 - 0.52), proving the effectiveness of the engineered lag features.
 
-## 4. API Serving & Architecture
+## 4. API Serving & Production Architecture
 
-The trained model is deployed using **FastAPI** to provide a fast, production-ready, and stateless REST API.
+The trained model is deployed as a REST API using **FastAPI**. 
 
-### 💡 API Design Note: Time Series Statefulness & Scenario Simulation
-Unlike standard machine learning models, Time-Series forecasting relies heavily on sequential Lags (historical states). It cannot mathematically "jump" to random future dates without generating the intermediate days first. 
+Building a robust, production-ready API exposed me to challenges beyond local scripting. I utilized AI assistance to understand and implement crucial Site Reliability Engineering (SRE) standards:
 
-To provide a seamless UX while respecting the algorithm's mathematical constraints, the `/predict_next_day` endpoint utilizes a **Scenario Simulation** approach:
-1. The API dynamically identifies the chronological "Next Day" based on the model's internal memory using `make_future_dataframe(h=1)`.
-2. It overrides the dynamic features (weather, pricing, promotions) of that generated day with the user's JSON payload.
-3. It filters out static features to prevent dimensionality conflicts and runs the prediction.
-
-This allows stakeholders to perform **What-If Analysis** (e.g., *"What happens to our demand tomorrow if it rains and we drop the price by 10%?"*) without breaking the time-series continuum.
+### Key Architectural Lessons Learned (AI-Assisted)
+1. **$O(1)$ Inference via Caching:** A naive implementation would force the model to re-generate the future dataframe for *all* 30,000+ products on every single request, causing severe CPU bottlenecks. The solution was to pre-compute the base dataframe *once* at startup and filter it strictly to the requested $O(1)$ row before copying.
+2. **Concurrency & Event Loop Safety:** Machine Learning inference is heavily CPU-bound. If executed directly in an `async def` endpoint, it would block FastAPI's event loop, crashing the server under load. The fix was to offload the prediction task to a dedicated thread pool using `run_in_executor`.
+3. **Application Lifespan Management:** To prevent memory leaks and avoid the anti-pattern of global variables, the model and cache are safely initialized and destroyed using FastAPI's `@asynccontextmanager` lifespan events.
 
 ### 🔒 API Authentication
-This API is secured with API Key authentication to simulate production environments.
-To test the endpoints via Swagger UI (http://localhost:8000/docs) or cURL, please use the following testing key:
+To simulate a consumer-facing production environment, the endpoints are secured against unauthorized access. If you are testing the API via Swagger UI (`http://localhost:8000/docs`) or cURL, you **MUST** authorize using this testing key:
 
-Header Name: X-API-Key
-
-Value: ksynerx-secret-key-2026
+* **Header Name:** `X-API-Key`
+* **Value:** `ksynerx-secret-key-2026`
 
 ## 5. Getting Started
 
-Follow these steps to run the pipeline locally on a Windows/Linux machine.
+Follow these steps to run the end-to-end pipeline locally. The project uses absolute pathing resolution (`pathlib`), so you can safely run these commands from the project root directory.
 
 ### Prerequisites
 * Python 3.9+
 * Git
+* *Recommended:* A Python virtual environment (`venv` or `conda`)
 
 ### Installation
 
-1. **Clone the repository:**
+1. **Clone the repository & setup environment:**
    ```bash
    git clone <your-repository-url>
    cd demand-forecasting
+   
+   # Optional but recommended: Create and activate a virtual environment
+   python -m venv venv
+   # On Windows: venv\Scripts\activate
+   # On Linux/Mac: source venv/bin/activate
+   ```
+
 2. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
-3. **Run process:**
-   ```bash
-   python data/preparation.py
-   python data/train_model.py
+   ```
+
+### Running the Pipeline
+
+**Step 1: Data Preparation**
+Run the data pipeline to clean the raw data, extract features, and apply outlier clipping.
+```bash
+python data/preparation.py
+```
+*🎯 **Output:** Generates `train_ready.parquet` and `eval_ready.parquet` inside the `data/` directory.*
+
+**Step 2: Model Training**
+Execute the multi-model training pipeline. This will train LightGBM, Ridge, and Random Forest, evaluate them via Walk-Forward validation, and save the best pipeline.
+```bash
+python data/train_model.py
+```
+*🎯 **Output:** Generates the serialized model file `trained_lgbm_pipeline.pkl` inside the `models/` directory.*
+
+**Step 3: Start the API Server**
+Launch the FastAPI application using Uvicorn.
+```bash
+uvicorn api.serve_api:app --reload
+```
+*🎯 **Output:** Starts a local web server running on `http://127.0.0.1:8000`.*
+
+### Testing the API (Swagger UI)
+
+FastAPI automatically generates an interactive documentation page where you can test the predictions directly from your browser.
+
+1. Open your web browser and navigate to: **http://localhost:8000/docs**
+2. **Authenticate:** * Click the green **Authorize** button (🔒) on the top right of the page.
+   * In the `Value` field, enter the testing API Key: `ksynerx-secret-key-2026`
+   * Click **Authorize** and then **Close**.
+3. **Run a Health Check:**
+   * Expand the `GET /health` endpoint and click **Try it out** -> **Execute** to verify the model is loaded.
+4. **Make a Prediction:**
+   * Expand the `POST /predict_next_day` endpoint.
+   * Click **Try it out**.
+   * A sample JSON payload is already pre-filled. Simply click the blue **Execute** button.
+   * Scroll down to the **Server response** section to see the forecasted demand!
 

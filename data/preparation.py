@@ -4,6 +4,8 @@ import yaml
 from pathlib import Path
 
 def load_config():
+    # [AUTHOR] Sử dụng pathlib để xây dựng đường dẫn tuyệt đối (Absolute Path).
+    # Giúp hệ thống không bị lỗi FileNotFoundError khi chạy từ các thư mục (CWD) khác nhau.
     BASE_DIR = Path(__file__).resolve().parent.parent
     config_path = BASE_DIR / "config" / "config.yaml"
     if not config_path.exists():
@@ -12,6 +14,7 @@ def load_config():
         return yaml.safe_load(f)
 
 def filter_target_city(df: pd.DataFrame, target_city: int) -> pd.DataFrame:
+    # [AUTHOR] Logic lọc dữ liệu để train cho từng thành phố 
     print(f"[INFO] Filtering data for target_city: {target_city}")
     filtered = df[df['city_id'] == target_city].copy()
     if filtered.empty:
@@ -21,16 +24,17 @@ def filter_target_city(df: pd.DataFrame, target_city: int) -> pd.DataFrame:
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     processed = df.copy()
     
-    # thời gian
+    # [AUTHOR] Trích xuất các đặc trưng thời gian cơ bản
     dates = pd.to_datetime(processed['dt'])
     processed['ds'] = dates
     processed['week_of_year'] = dates.dt.isocalendar().week.astype(int)
     processed['year'] = dates.dt.year
     
-    # Unique ID
+    # [AI-ASSISTED] Tạo khóa chính (Unique ID) cho thuật toán phân cụm Time-series
     processed['unique_id'] = processed['store_id'].astype(str) + "_" + processed['product_id'].astype(str)
     
-    # Adjusted Demand (LDR)
+    # --- TÍNH TOÁN LOST DEMAND RATE (LDR) ---
+    # [AUTHOR] Định hình công thức cơ sở: Dựa trên 16 giờ mở cửa tiêu chuẩn.
     available_hours = 16 - processed['stock_hour6_22_cnt']
     processed['adjusted_demand'] = np.where(
         processed['sale_amount'] == 0, 
@@ -38,20 +42,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         processed['sale_amount'] * (16 / np.maximum(available_hours, 1))
     )
     
-    # Log và Cap Outliers (Giới hạn giá trị ngoại lai)
+    # [AI-OPTIMIZED] Kỹ thuật Outlier Capping (Cắt ngọn ngoại lai)
+    # Giới hạn các dự đoán bùng nổ vô lý do chia tỷ lệ ở phân vị 99.9% để bảo vệ mô hình Tree-based.
     p99 = processed['adjusted_demand'].quantile(0.99)
     print(f"[INFO] 99th percentile of adjusted_demand is: {p99:.2f}. Capping extreme outliers.")
     # Cắt ngọn (clip) ở mức phân vị 99.9% để tránh các ca nhu cầu bùng nổ vô lý (24x, 50x)
     p999 = processed['adjusted_demand'].quantile(0.999)
     processed['adjusted_demand'] = processed['adjusted_demand'].clip(upper=p999)
     
-    # Xử lý các cột tên gốc
+    # [AUTHOR] Chuẩn hóa tên cột cho mlforecast
     processed['selling_price'] = processed['discount']
     processed['y'] = processed['adjusted_demand']
     
     return processed
 
 def check_date_gaps(df: pd.DataFrame):
+    # [AI-ASSISTED] Kỹ thuật kiểm tra tính toàn vẹn của Time-series.
+    # Dùng groupby và diff để phát hiện các chuỗi bị đứt gãy ngày tháng, tránh làm hỏng các biến Lag.
     """Date Gaps"""
     temp = df.sort_values(['unique_id', 'ds'])
     temp['date_diff'] = temp.groupby('unique_id')['ds'].diff().dt.days
@@ -64,6 +71,7 @@ def check_date_gaps(df: pd.DataFrame):
         print("[INFO] No date gaps detected. Time series is contiguous.")
 
 def validate_data(df: pd.DataFrame):
+    # [AI-ASSISTED] Cổng kiểm duyệt dữ liệu (Data Quality Gate) chuẩn Production
     print("[INFO] Running Data Validation...")
     if (df['sale_amount'] < 0).any():
         raise ValueError("Critical Data Error: Found negative sales amounts.")
@@ -76,6 +84,7 @@ def validate_data(df: pd.DataFrame):
     return df
 
 def main():
+    # [AI-ASSISTED] Luồng thực thi chính (Pipeline execution)
     cfg = load_config()
     BASE_DIR = Path(__file__).resolve().parent.parent
     
@@ -106,7 +115,6 @@ def main():
     train_ready = train_ready.drop(columns=drop_cols)
     eval_ready = eval_ready.drop(columns=drop_cols)
     
-    # Lưu file
     train_out_path = BASE_DIR / cfg['data']['files']['train']['processed']
     eval_out_path = BASE_DIR / cfg['data']['files']['eval']['processed']
     

@@ -22,6 +22,8 @@ def load_config():
         return yaml.safe_load(f), BASE_DIR
 
 def calculate_wmape(y_true: pd.Series, y_pred: pd.Series) -> float:
+    # [AI-ASSISTED] Triển khai Weighted MAPE (wMAPE).
+    # Tiêu chuẩn ngành bán lẻ để đánh giá sai số, tránh việc các sản phẩm bán ế làm nhiễu kết quả.
     sum_abs_error = np.sum(np.abs(y_true - y_pred))
     sum_actual = np.sum(np.abs(y_true))
     if sum_actual == 0:
@@ -39,14 +41,15 @@ def main():
     raw_static_features = cfg['data'].get('static_features', [])
     static_features = [col for col in raw_static_features if col in train_df.columns]
 
-    # Chuyển đổi Category
+    # [AUTHOR] Khai báo và ép kiểu dữ liệu danh mục (Categorical) cho LightGBM
     cat_cols = ['day_of_week', 'month', 'week_of_year', 'year', 'is_weekend', 'is_month_start', 'is_month_end']
     for col in static_features + cat_cols:
         if col in train_df.columns:
             train_df[col] = train_df[col].astype('category')
             eval_df[col] = eval_df[col].astype('category')
 
-    # Dọn dẹp cột rác (Object/Text)
+    # [AI-ASSISTED] Tự động dọn dẹp cột rác (Text/Object).
+    # Ngăn chặn lỗi crash của thư viện LightGBM khi vô tình nuốt phải dữ liệu không phải dạng số.
     object_cols = train_df.select_dtypes(include=['object']).columns.tolist()
     if 'unique_id' in object_cols:
         object_cols.remove('unique_id')
@@ -57,19 +60,21 @@ def main():
     lgbm_params = cfg['model']['lgbm_params']
     lgbm_params.update({'num_leaves': 64, 'min_child_samples': 40})
     
+    # [AUTHOR] Thiết lập mô hình
     models = {
         'lightgbm': LGBMRegressor(**lgbm_params),
         'ridge_baseline': Ridge(alpha=1.0),
         'random_forest': RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42, n_jobs=-1)
     }
     
+    # [AI-ASSISTED] Khởi tạo MLForecast pipeline với các độ trễ (lags)
     fcst_pipeline = MLForecast(
         models=models,
         freq='D',
         lags=cfg['model']['lags'],
         lag_transforms={
             1: [(rolling_mean, 7), (rolling_std, 7)],  
-            7: [(rolling_mean, 14), (rolling_std, 14)] # Bổ sung Std cho lag_7
+            7: [(rolling_mean, 14), (rolling_std, 14)] 
         },
         num_threads=4
     )
@@ -91,7 +96,8 @@ def main():
     
     results = predictions.merge(eval_df[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='inner')
     
-    # --- Đánh giá theo từng bước thời gian (Horizon) ---
+    # [AI-ASSISTED] Triển khai Walk-forward Validation (Đánh giá theo từng bước Horizon).
+    # Khắc phục điểm mù của Global MAE, giúp quan sát mức độ suy thoái của dự báo theo thời gian.
     results['horizon_step'] = results.groupby('unique_id').cumcount() + 1
     
     print("\n" + "="*60)
