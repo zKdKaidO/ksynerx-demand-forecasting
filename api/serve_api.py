@@ -3,19 +3,31 @@ import yaml
 import joblib
 import pandas as pd
 import logging
+import uuid
+import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-# --- BẬT HỆ THỐNG LOGGING CHUẨN PRODUCTION (Fix Issue 8) ---
+# --- LOGGING VỚI CORRELATION ID (Fix Issue 1.7) ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("api_serving")
 
-# --- REQUEST SCHEMA VỚI RÀO CHẮN NGHIÊM NGẶT (Fix Issue 7) ---
+# --- API AUTHENTICATION (Fix Issue 1.8) ---
+API_KEY = "ksynerx-secret-key-2026"
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return api_key
+
+# --- REQUEST SCHEMA ---
 class ForecastInput(BaseModel):
     unique_id: str = Field(..., description="Store and product ID combination")
     selling_price: float = Field(..., ge=0.0, description="Selling price cannot be negative")
@@ -70,7 +82,6 @@ async def lifespan(app: FastAPI):
         logger.info("API successfully started and ready.")
     except Exception as e:
         logger.error(f"Critical Startup Failure: {e}", exc_info=True)
-        # Nếu model hỏng, cho API sập luôn (Fail-Fast)
         raise e
         
     yield 
@@ -82,33 +93,61 @@ async def lifespan(app: FastAPI):
 # --- API INITIALIZATION ---
 app = FastAPI(
     title="Fresh Retail Demand API",
-    description="Enterprise-grade API with strict validation, observability, and dynamic configurations.",
-    version="4.0.0",
+    description="Enterprise-grade API with auth, async inference, and real-time cache injection.",
+    version="5.0.0",
     lifespan=lifespan
 )
 
-# --- ENDPOINTS ---
+# --- MIDDLEWARE: THEO DÕI REQUEST TỪNG NGƯỜI DÙNG (Fix Issue 1.7) ---
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    request.state.request_id = str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
+# --- HEALTH ENDPOINT (Fix Issue 1.4) ---
+@app.get("/health")
+async def health_check(request: Request):
+    if getattr(request.app.state, 'pipeline', None) is None:
+        raise HTTPException(status_code=503, detail="Service Unavailable: Model not loaded")
+    return {"status": "ok", "message": "Service is healthy and fully operational."}
+
+# --- PREDICT ENDPOINT BẤT ĐỒNG BỘ (Fix Issue 1.3) ---
 @app.post("/predict_next_day")
-def predict_next_day_demand(payload: ForecastInput, request: Request):
+async def predict_next_day_demand(
+    payload: ForecastInput, 
+    request: Request, 
+    api_key: str = Depends(verify_api_key)  # Yêu cầu nhập Key
+):
     pipeline = request.app.state.pipeline
     base_X_df = request.app.state.base_X_df
     cfg = request.app.state.cfg
+    req_id = request.state.request_id
     
     if pipeline is None or base_X_df is None:
-        logger.error("Predict endpoint called but model/cache is uninitialized.")
-        raise HTTPException(status_code=500, detail="Internal Service Error: Model unavailable.")
+        logger.error(f"[{req_id}] Predict endpoint called but model/cache is uninitialized.")
+        raise HTTPException(status_code=503, detail="Internal Service Error: Model unavailable.")
 
     try:
-        # Lọc $O(1)$ ngay lập tức
-        X_df_full = base_X_df.copy()
-        if payload.unique_id not in X_df_full['unique_id'].values:
+        # --- FIX ISSUE 1.1: Lọc đúng 1 dòng TRƯỚC KHI copy (O(1) Memory) ---
+        row = base_X_df[base_X_df['unique_id'] == payload.unique_id]
+        if row.empty:
             raise ValueError(f"ID '{payload.unique_id}' not found in training history.")
+        X_df = row.copy()
 
-        X_df = X_df_full[X_df_full['unique_id'] == payload.unique_id].copy()
+        # --- FIX ISSUE 1.2: Chống Cache thiu, ép ngày dự báo thành 'Ngày mai' ở thời điểm hiện tại ---
+        actual_tomorrow = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+        X_df['ds'] = actual_tomorrow
 
         # Feature Engineering
         X_df['day_of_week'] = X_df['ds'].dt.dayofweek
         X_df['month'] = X_df['ds'].dt.month
+        
+        # --- FIX ISSUE 1.5 (CRITICAL): Bổ sung cột năm và tuần để khớp với Train ---
+        X_df['week_of_year'] = X_df['ds'].dt.isocalendar().week.astype(int)
+        X_df['year'] = X_df['ds'].dt.year
+        
         X_df['is_weekend'] = X_df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
         X_df['is_month_start'] = X_df['ds'].dt.is_month_start.astype(int)
         X_df['is_month_end'] = X_df['ds'].dt.is_month_end.astype(int)
@@ -124,43 +163,39 @@ def predict_next_day_demand(payload: ForecastInput, request: Request):
         X_df['is_hot_weather'] = 1 if payload.temperature > 32 else 0
 
         # Ép kiểu
-        cat_cols = ['day_of_week', 'month', 'is_weekend', 'is_month_start', 'is_month_end', 'holiday', 'is_promotion', 'is_raining', 'is_hot_weather']
+        cat_cols = ['day_of_week', 'month', 'week_of_year', 'year', 'is_weekend', 'is_month_start', 'is_month_end', 'holiday', 'is_promotion', 'is_raining', 'is_hot_weather']
         for col in cat_cols:
             X_df[col] = X_df[col].astype('category')
 
-        # --- FIX ISSUE 5: Lấy static features từ file config thay vì hardcode ---
+        # Drop tính năng tĩnh (Chống lỗi thiếu tên cột - Issue 1.6)
         static_features = cfg.get('data', {}).get('static_features', [])
-        # Chỉ drop những cột thực sự tồn tại, bỏ errors='ignore' rủi ro
         cols_to_drop = [c for c in static_features if c in X_df.columns]
         X_df_pred = X_df.drop(columns=cols_to_drop)
 
-        # Chạy dự báo
-        predictions = pipeline.predict(h=1, X_df=X_df_pred)
+        # Chạy model bằng Thread Pool chống sập sự kiện vòng lặp (Fix Issue 1.3)
+        loop = asyncio.get_running_loop()
+        predictions = await loop.run_in_executor(None, lambda: pipeline.predict(h=1, X_df=X_df_pred))
         target_pred = predictions.iloc[0]
 
-        # --- FIX ISSUE 6: Tự động dò tìm tên cột dự đoán ---
-        # mlforecast luôn trả về unique_id, ds, và [tên_model]
-        model_cols = [col for col in predictions.columns if col not in ['unique_id', 'ds']]
-        if not model_cols:
-            raise RuntimeError("Model prediction column missing from output.")
-        model_name = model_cols[0] 
+        # --- FIX ISSUE 3.8: Tự đọc tên Model chạy chính từ Config ---
+        model_name = cfg.get('model', {}).get('algorithm', 'lightgbm')
+        if model_name not in target_pred:
+            raise RuntimeError(f"Configured model '{model_name}' not found in prediction output.")
 
         predicted_value = max(0.0, round(float(target_pred[model_name]), 2))
         
-        logger.info(f"Successful prediction for {payload.unique_id}: {predicted_value}")
+        logger.info(f"[{req_id}] Successful prediction for {payload.unique_id}: {predicted_value}")
         return {
             "unique_id": payload.unique_id,
             "forecast_date": target_pred['ds'].strftime('%Y-%m-%d'),
             "model_engine": model_name,
-            "predicted_adjusted_demand": predicted_value
+            "predicted_adjusted_demand": predicted_value,
+            "request_id": req_id
         }
 
-    # --- FIX ISSUE 9: Phân loại rạch ròi 400 vs 500 ---
     except ValueError as ve:
-        # Lỗi Client (400): Do user gửi ID vớ vẩn
-        logger.warning(f"Bad Request: {ve}")
+        logger.warning(f"[{req_id}] Bad Request: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        # Lỗi Server (500): Tràn RAM, lỗi Pandas, lỗi hàm số...
-        logger.error(f"Internal Server Error during prediction: {e}", exc_info=True)
+        logger.error(f"[{req_id}] Internal Server Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred while processing the request.")

@@ -36,12 +36,17 @@ The forecasting engine uses **LightGBMRegressor** wrapped inside Nixtla's `mlfor
 2. **Categorical Handling:** It natively supports categorical features without requiring explosive One-Hot Encoding, which is crucial for retail data with thousands of product IDs.
 3. **Time-Series Suitability:** Combined with `mlforecast`, it efficiently captures non-linear relationships using historical lags (Lags: 1, 2, 3, 7) and rolling window aggregations (7-day rolling mean).
 
-### Model Evaluation Results
-The model was trained on the `train` split and strictly evaluated on the unseen `eval` split to ensure out-of-sample robustness.
-* **Mean Absolute Error (MAE):** 0.5782
-* **Root Mean Squared Error (RMSE):** 1.0310
+### Model Evaluation Results (City-Level Scope)
+After strictly filtering for the target city and applying outlier capping, the multi-model benchmarking on the held-out dataset yielded:
 
-*Interpretation: On average, the model's prediction deviates by less than 0.6 units per store-product combination, indicating high reliability for fresh produce where daily fluctuations are normal.*
+* **LightGBM (Selected):** MAE = 0.5658 | RMSE = 1.0014 | wMAPE = 42.28%
+* **Ridge Baseline:** MAE = 0.5765 | RMSE = 0.9638 | wMAPE = 43.07%
+* **Random Forest:** MAE = 0.5858 | RMSE = 1.0556 | wMAPE = 43.77%
+
+**Key Insights:**
+* LightGBM generalizes best overall, dominating MAE and volume-weighted error (wMAPE).
+* Ridge Regression provided the lowest RMSE, indicating high resistance to extreme outlier predictions.
+* Horizon analysis (Walk-forward) confirms stable error rates across the first 3 days (MAE ~0.50 - 0.52), proving the effectiveness of the engineered lag features.
 
 ## 4. API Serving & Architecture
 
@@ -57,6 +62,14 @@ To provide a seamless UX while respecting the algorithm's mathematical constrain
 
 This allows stakeholders to perform **What-If Analysis** (e.g., *"What happens to our demand tomorrow if it rains and we drop the price by 10%?"*) without breaking the time-series continuum.
 
+### 🔒 API Authentication
+This API is secured with API Key authentication to simulate production environments.
+To test the endpoints via Swagger UI (http://localhost:8000/docs) or cURL, please use the following testing key:
+
+Header Name: X-API-Key
+
+Value: ksynerx-secret-key-2026
+
 ## 5. Getting Started
 
 Follow these steps to run the pipeline locally on a Windows/Linux machine.
@@ -71,3 +84,9 @@ Follow these steps to run the pipeline locally on a Windows/Linux machine.
    ```bash
    git clone <your-repository-url>
    cd demand-forecasting
+2. **Install dependencies:**
+   pip install -r requirements.txt
+3. **Run process:**
+   python data/preparation.py
+   python data/train_model.py
+
