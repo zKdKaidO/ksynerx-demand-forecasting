@@ -85,8 +85,10 @@ Follow these steps to run the pipeline locally on a Windows/Linux machine.
    git clone <your-repository-url>
    cd demand-forecasting
 2. **Install dependencies:**
+   ```bash
    pip install -r requirements.txt
 3. **Run process:**
+   ```bash
    python data/preparation.py
    python data/train_model.py
 
