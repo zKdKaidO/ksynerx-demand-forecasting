@@ -7,31 +7,30 @@ def load_config():
     BASE_DIR = Path(__file__).resolve().parent.parent
     config_path = BASE_DIR / "config" / "config.yaml"
     if not config_path.exists():
-        raise FileNotFoundError(f"[CRITICAL] Không tìm thấy file config tại: {config_path}")
+        raise FileNotFoundError(f"[CRITICAL] No config file found at: {config_path}")
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
 def filter_target_city(df: pd.DataFrame, target_city: int) -> pd.DataFrame:
-    """FIX ISSUE 2.1: Phục hồi tính năng lọc dữ liệu theo thành phố từ config."""
     print(f"[INFO] Filtering data for target_city: {target_city}")
     filtered = df[df['city_id'] == target_city].copy()
     if filtered.empty:
-        print(f"[WARNING] No data found for city_id {target_city}!")
+        print(f"[WARNING] No data found for city_id {target_city}")
     return filtered
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     processed = df.copy()
     
-    # Xử lý thời gian
+    # thời gian
     dates = pd.to_datetime(processed['dt'])
     processed['ds'] = dates
     processed['week_of_year'] = dates.dt.isocalendar().week.astype(int)
     processed['year'] = dates.dt.year
     
-    # Xây dựng Khóa chính (Unique ID)
+    # Unique ID
     processed['unique_id'] = processed['store_id'].astype(str) + "_" + processed['product_id'].astype(str)
     
-    # Tính toán Adjusted Demand (LDR)
+    # Adjusted Demand (LDR)
     available_hours = 16 - processed['stock_hour6_22_cnt']
     processed['adjusted_demand'] = np.where(
         processed['sale_amount'] == 0, 
@@ -39,7 +38,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         processed['sale_amount'] * (16 / np.maximum(available_hours, 1))
     )
     
-    # --- FIX ISSUE 2.4: Log và Cap Outliers (Giới hạn giá trị ngoại lai) ---
+    # Log và Cap Outliers (Giới hạn giá trị ngoại lai)
     p99 = processed['adjusted_demand'].quantile(0.99)
     print(f"[INFO] 99th percentile of adjusted_demand is: {p99:.2f}. Capping extreme outliers.")
     # Cắt ngọn (clip) ở mức phân vị 99.9% để tránh các ca nhu cầu bùng nổ vô lý (24x, 50x)
@@ -53,7 +52,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return processed
 
 def check_date_gaps(df: pd.DataFrame):
-    """FIX ISSUE 2.3: Phát hiện khoảng trống thời gian (Date Gaps)."""
+    """Date Gaps"""
     temp = df.sort_values(['unique_id', 'ds'])
     temp['date_diff'] = temp.groupby('unique_id')['ds'].diff().dt.days
     gaps = temp[temp['date_diff'] > 1]
@@ -98,7 +97,7 @@ def main():
     eval_ready = build_features(eval_df)
     eval_ready = validate_data(eval_ready)
     
-    # --- FIX ISSUE 2.2: Rạch ròi việc xóa cột rò rỉ (Leakage) ---
+    # --- (Leakage) ---
     # Giữ lại 'y', 'ds', 'unique_id', 'selling_price' và các cột static/features. 
     # Xóa hoàn toàn các cột trung gian tạo ra 'y'.
     leakage_cols = ['dt', 'adjusted_demand', 'sale_amount', 'stock_hour6_22_cnt', 'discount']
