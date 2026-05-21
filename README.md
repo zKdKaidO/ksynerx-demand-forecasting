@@ -22,7 +22,7 @@ demand-forecasting/
 ├── .gitignore                 
 ├── README.md                       
 └── requirements.txt   
-
+```
 To clearly explain how the working prototype functions from end-to-end, here is the lifecycle of the data and model within the system:
 
 1. **The Data Refinery (`preparation.py`):** The prototype starts by ingesting raw parquet files. It does not simply pass data through; it actively corrects business logic (Lost Demand Rate), caps extreme statistical outliers (99.9th percentile), and verifies time-series contiguity (date gap detection).
